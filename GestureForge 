@@ -1,0 +1,525 @@
+import React, { useEffect, useRef, useState, useCallback } from 'react';
+import * as THREE from 'https://cdn.jsdelivr.net/npm/three@r128/build/three.module.js';
+import { Hands, HAND_CONNECTIONS } from 'https://cdn.jsdelivr.net/npm/@mediapipe/hands/';
+import { Camera } from 'https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/';
+import { drawConnectors, drawLandmarks } from 'https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/';
+
+export default function GestureForge() {
+  const videoRef = useRef(null);
+  const canvasRef = useRef(null);
+  const sceneRef = useRef(null);
+  const rendererRef = useRef(null);
+  const objectsRef = useRef([]);
+  const drawingPointsRef = useRef([]);
+  const isDrawingRef = useRef(false);
+  const lastPositionRef = useRef({ x: 0, y: 0 });
+  const cameraInstanceRef = useRef(null);
+  
+  const [brushColor, setBrushColor] = useState('#00ff88');
+  const [brushSize, setBrushSize] = useState(2);
+  const [glowIntensity, setGlowIntensity] = useState(1);
+  const [handState, setHandState] = useState({ left: false, right: false });
+  const [frameRate, setFrameRate] = useState(60);
+  
+  const colors = [
+    '#00ff88', // Neon green
+    '#0099ff', // Neon blue
+    '#ff00ff', // Magenta
+    '#ff0088', // Hot pink
+    '#00ffff', // Cyan
+    '#ffff00', // Yellow
+  ];
+
+  // Initialize Three.js scene
+  useEffect(() => {
+    if (!canvasRef.current) return;
+
+    // Scene setup
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0a0a0a);
+    sceneRef.current = scene;
+
+    const renderer = new THREE.WebGLRenderer({ canvas: canvasRef.current, antialias: true, alpha: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(window.devicePixelRatio);
+    rendererRef.current = renderer;
+
+    // Lighting
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+    scene.add(ambientLight);
+
+    const pointLight = new THREE.PointLight(0x00ffff, 1);
+    pointLight.position.set(5, 5, 5);
+    scene.add(pointLight);
+
+    // Camera
+    const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.z = 5;
+
+    // Animation loop
+    const animate = () => {
+      requestAnimationFrame(animate);
+      
+      // Update objects
+      objectsRef.current.forEach(obj => {
+        if (obj.mesh) {
+          obj.mesh.rotation.x += 0.005;
+          obj.mesh.rotation.y += 0.005;
+          
+          // Apply gravity
+          if (obj.velocity) {
+            obj.velocity.y -= 0.001;
+            obj.mesh.position.add(obj.velocity);
+            
+            // Remove if too far down
+            if (obj.mesh.position.y < -10) {
+              scene.remove(obj.mesh);
+              objectsRef.current = objectsRef.current.filter(o => o !== obj);
+            }
+          }
+        }
+      });
+
+      // Render drawing trails
+      drawingPointsRef.current.forEach(point => {
+        point.life -= 1;
+        if (point.mesh) {
+          point.mesh.material.opacity = point.life / 255;
+          if (point.life <= 0) {
+            scene.remove(point.mesh);
+          }
+        }
+      });
+      drawingPointsRef.current = drawingPointsRef.current.filter(p => p.life > 0);
+
+      renderer.render(scene, camera);
+    };
+
+    animate();
+
+    // Handle window resize
+    const handleResize = () => {
+      const width = window.innerWidth;
+      const height = window.innerHeight;
+      renderer.setSize(width, height);
+      camera.aspect = width / height;
+      camera.updateProjectionMatrix();
+    };
+
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
+
+  // Initialize MediaPipe Hands
+  useEffect(() => {
+    if (!videoRef.current || !canvasRef.current) return;
+
+    const hands = new Hands({
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
+    });
+
+    hands.setOptions({
+      maxNumHands: 2,
+      modelComplexity: 1,
+      minDetectionConfidence: 0.5,
+      minTrackingConfidence: 0.5,
+    });
+
+    let frameCount = 0;
+    let lastTime = Date.now();
+
+    hands.onResults((results) => {
+      frameCount++;
+      const currentTime = Date.now();
+      if (currentTime - lastTime >= 1000) {
+        setFrameRate(frameCount);
+        frameCount = 0;
+        lastTime = currentTime;
+      }
+
+      const canvas = canvasRef.current;
+      const ctx = canvas.getContext('2d');
+      
+      // Clear canvas
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // Draw hand landmarks
+      if (results.multiHandLandmarks && results.multiHandedness) {
+        results.multiHandLandmarks.forEach((landmarks, idx) => {
+          const handedness = results.multiHandedness[idx].label;
+          const isRight = handedness === 'Right';
+          
+          // Update hand state
+          setHandState(prev => ({
+            ...prev,
+            [isRight ? 'right' : 'left']: true,
+          }));
+
+          // Draw connections
+          drawConnectors(ctx, landmarks, HAND_CONNECTIONS, {
+            color: isRight ? '#0099ff' : '#00ff88',
+            lineWidth: 2,
+          });
+
+          // Draw landmarks
+          drawLandmarks(ctx, landmarks, {
+            color: isRight ? '#ff00ff' : '#ffff00',
+            lineWidth: 1,
+            radius: 2,
+          });
+
+          // Handle drawing with index finger
+          const indexTip = landmarks[8];
+          const indexPIP = landmarks[6];
+          const middleTip = landmarks[12];
+          const thumbTip = landmarks[4];
+
+          if (indexTip && indexPIP) {
+            const currentX = indexTip.x * canvas.width;
+            const currentY = indexTip.y * canvas.height;
+
+            // Check if index finger is raised (drawing mode)
+            const isIndexRaised = indexTip.y < indexPIP.y;
+            
+            // Check for closed fist (pause drawing)
+            const fingerDistance = Math.sqrt(
+              Math.pow(indexTip.x - middleTip.x, 2) + 
+              Math.pow(indexTip.y - middleTip.y, 2)
+            );
+            const isClosedFist = fingerDistance < 0.05;
+
+            // Check for pinch (eraser)
+            const thumbIndexDistance = Math.sqrt(
+              Math.pow(indexTip.x - thumbTip.x, 2) + 
+              Math.pow(indexTip.y - thumbTip.y, 2)
+            );
+            const isPinch = thumbIndexDistance < 0.05;
+
+            if (isIndexRaised && !isClosedFist && isPinch === false) {
+              isDrawingRef.current = true;
+              addDrawingPoint(currentX, currentY, brushColor);
+            } else {
+              isDrawingRef.current = false;
+            }
+          }
+        });
+      } else {
+        setHandState({ left: false, right: false });
+      }
+    });
+
+    const camera = new Camera(videoRef.current, {
+      onFrame: async () => {
+        await hands.send({ image: videoRef.current });
+      },
+      width: 1280,
+      height: 720,
+    });
+
+    cameraInstanceRef.current = camera;
+    camera.start();
+
+    return () => {
+      if (cameraInstanceRef.current) {
+        cameraInstanceRef.current.stop();
+      }
+    };
+  }, [brushColor]);
+
+  const addDrawingPoint = useCallback((x, y, color) => {
+    const scene = sceneRef.current;
+    if (!scene) return;
+
+    const geometry = new THREE.SphereGeometry(0.02, 8, 8);
+    const material = new THREE.MeshBasicMaterial({
+      color: color,
+      emissive: color,
+      transparent: true,
+      opacity: 0.8,
+    });
+
+    const sphere = new THREE.Mesh(geometry, material);
+    
+    // Convert 2D canvas coords to 3D world coords
+    const depth = 2;
+    sphere.position.set(
+      (x / window.innerWidth - 0.5) * 8,
+      (0.5 - y / window.innerHeight) * 6,
+      depth
+    );
+
+    scene.add(sphere);
+    drawingPointsRef.current.push({
+      mesh: sphere,
+      life: 255,
+    });
+  }, []);
+
+  const addObject = useCallback((type) => {
+    const scene = sceneRef.current;
+    if (!scene) return;
+
+    let geometry;
+    let position = { x: (Math.random() - 0.5) * 4, y: 2, z: 2 };
+
+    switch (type) {
+      case 'cube':
+        geometry = new THREE.BoxGeometry(0.5, 0.5, 0.5);
+        break;
+      case 'sphere':
+        geometry = new THREE.SphereGeometry(0.3, 16, 16);
+        break;
+      case 'cylinder':
+        geometry = new THREE.CylinderGeometry(0.3, 0.3, 0.8, 16);
+        break;
+      default:
+        geometry = new THREE.BoxGeometry(0.4, 0.4, 0.4);
+    }
+
+    const material = new THREE.MeshStandardMaterial({
+      color: colors[Math.floor(Math.random() * colors.length)],
+      emissive: colors[Math.floor(Math.random() * colors.length)],
+      emissiveIntensity: 0.5,
+      metalness: 0.7,
+      roughness: 0.2,
+    });
+
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.position.set(position.x, position.y, position.z);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+
+    scene.add(mesh);
+
+    objectsRef.current.push({
+      mesh,
+      velocity: {
+        x: (Math.random() - 0.5) * 0.1,
+        y: 0,
+        z: (Math.random() - 0.5) * 0.1,
+      },
+    });
+  }, []);
+
+  const clearCanvas = useCallback(() => {
+    drawingPointsRef.current.forEach(point => {
+      if (point.mesh) {
+        sceneRef.current.remove(point.mesh);
+      }
+    });
+    drawingPointsRef.current = [];
+  }, []);
+
+  const clearObjects = useCallback(() => {
+    objectsRef.current.forEach(obj => {
+      if (obj.mesh) {
+        sceneRef.current.remove(obj.mesh);
+      }
+    });
+    objectsRef.current = [];
+  }, []);
+
+  const downloadArtwork = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const link = document.createElement('a');
+    link.href = canvas.toDataURL('image/png');
+    link.download = `gestureforge-${Date.now()}.png`;
+    link.click();
+  }, []);
+
+  return (
+    <div className="w-full h-screen bg-black overflow-hidden">
+      {/* Hidden video for hand tracking */}
+      <video
+        ref={videoRef}
+        className="hidden"
+        playsInline
+      />
+
+      {/* Three.js Canvas */}
+      <canvas
+        ref={canvasRef}
+        className="w-full h-full block"
+      />
+
+      {/* HUD Interface */}
+      <div className="absolute inset-0 pointer-events-none">
+        {/* Top Bar */}
+        <div className="absolute top-0 left-0 right-0 border-b border-cyan-500/30 bg-gradient-to-b from-cyan-500/10 to-transparent p-4">
+          <div className="flex justify-between items-center max-w-7xl mx-auto">
+            <h1 className="text-2xl font-bold tracking-wider text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 via-purple-400 to-pink-400">
+              GESTUREFORGE
+            </h1>
+            <div className="text-xs font-mono text-cyan-400/70">
+              FPS: {frameRate} | Hands: L:{handState.left ? 'â—' : 'â—‹'} R:{handState.right ? 'â—' : 'â—‹'}
+            </div>
+          </div>
+        </div>
+
+        {/* Left Panel - Drawing Controls */}
+        <div className="absolute left-4 top-24 w-64 border border-purple-500/50 bg-black/70 backdrop-blur rounded-lg p-4 space-y-4 pointer-events-auto">
+          <h2 className="text-sm font-mono text-purple-400 uppercase tracking-wide border-b border-purple-500/30 pb-2">
+            Drawing Tools
+          </h2>
+
+          {/* Brush Color */}
+          <div className="space-y-2">
+            <label className="text-xs text-cyan-300 font-mono">Brush Color</label>
+            <div className="grid grid-cols-6 gap-2">
+              {colors.map((color) => (
+                <button
+                  key={color}
+                  onClick={() => setBrushColor(color)}
+                  className={`w-full h-8 rounded border-2 transition-all ${
+                    brushColor === color
+                      ? `border-white shadow-lg`
+                      : 'border-transparent opacity-60 hover:opacity-100'
+                  }`}
+                  style={{
+                    backgroundColor: color,
+                    boxShadow: brushColor === color ? `0 0 12px ${color}` : 'none',
+                  }}
+                />
+              ))}
+            </div>
+          </div>
+
+          {/* Brush Size */}
+          <div className="space-y-2">
+            <label className="text-xs text-cyan-300 font-mono">
+              Brush Size: {brushSize}px
+            </label>
+            <input
+              type="range"
+              min="1"
+              max="8"
+              value={brushSize}
+              onChange={(e) => setBrushSize(parseInt(e.target.value))}
+              className="w-full h-1 bg-purple-900/50 rounded appearance-none cursor-pointer accent-cyan-400"
+            />
+          </div>
+
+          {/* Glow Intensity */}
+          <div className="space-y-2">
+            <label className="text-xs text-cyan-300 font-mono">
+              Glow Intensity: {(glowIntensity * 100).toFixed(0)}%
+            </label>
+            <input
+              type="range"
+              min="0"
+              max="2"
+              step="0.1"
+              value={glowIntensity}
+              onChange={(e) => setGlowIntensity(parseFloat(e.target.value))}
+              className="w-full h-1 bg-purple-900/50 rounded appearance-none cursor-pointer accent-cyan-400"
+            />
+          </div>
+
+          {/* Actions */}
+          <div className="pt-2 border-t border-purple-500/30 space-y-2">
+            <button
+              onClick={clearCanvas}
+              className="w-full py-2 px-3 bg-red-500/20 hover:bg-red-500/40 border border-red-500/50 text-red-300 text-xs font-mono rounded transition-all"
+            >
+              Clear Canvas
+            </button>
+            <button
+              onClick={downloadArtwork}
+              className="w-full py-2 px-3 bg-green-500/20 hover:bg-green-500/40 border border-green-500/50 text-green-300 text-xs font-mono rounded transition-all"
+            >
+              Save Artwork
+            </button>
+          </div>
+        </div>
+
+        {/* Right Panel - 3D Objects */}
+        <div className="absolute right-4 top-24 w-64 border border-pink-500/50 bg-black/70 backdrop-blur rounded-lg p-4 space-y-4 pointer-events-auto">
+          <h2 className="text-sm font-mono text-pink-400 uppercase tracking-wide border-b border-pink-500/30 pb-2">
+            3D Objects
+          </h2>
+
+          <p className="text-xs text-pink-300/70 font-mono leading-relaxed">
+            Spawn 3D shapes and interact with hand gestures. Pinch and drag to move.
+          </p>
+
+          <div className="grid grid-cols-2 gap-2">
+            <button
+              onClick={() => addObject('cube')}
+              className="py-2 px-3 bg-cyan-500/20 hover:bg-cyan-500/40 border border-cyan-500/50 text-cyan-300 text-xs font-mono rounded transition-all shadow-lg hover:shadow-cyan-500/50"
+            >
+              Cube
+            </button>
+            <button
+              onClick={() => addObject('sphere')}
+              className="py-2 px-3 bg-blue-500/20 hover:bg-blue-500/40 border border-blue-500/50 text-blue-300 text-xs font-mono rounded transition-all shadow-lg hover:shadow-blue-500/50"
+            >
+              Sphere
+            </button>
+            <button
+              onClick={() => addObject('cylinder')}
+              className="py-2 px-3 bg-purple-500/20 hover:bg-purple-500/40 border border-purple-500/50 text-purple-300 text-xs font-mono rounded transition-all shadow-lg hover:shadow-purple-500/50"
+            >
+              Cylinder
+            </button>
+            <button
+              onClick={() => {
+                for (let i = 0; i < 5; i++) {
+                  addObject(['cube', 'sphere', 'cylinder'][Math.floor(Math.random() * 3)]);
+                }
+              }}
+              className="py-2 px-3 bg-orange-500/20 hover:bg-orange-500/40 border border-orange-500/50 text-orange-300 text-xs font-mono rounded transition-all shadow-lg hover:shadow-orange-500/50"
+            >
+              Burst
+            </button>
+          </div>
+
+          <button
+            onClick={clearObjects}
+            className="w-full py-2 px-3 bg-red-500/20 hover:bg-red-500/40 border border-red-500/50 text-red-300 text-xs font-mono rounded transition-all"
+          >
+            Clear Objects
+          </button>
+        </div>
+
+        {/* Bottom Info */}
+        <div className="absolute bottom-4 left-4 right-4 max-w-7xl mx-auto border border-cyan-500/20 bg-black/50 backdrop-blur rounded p-3">
+          <div className="text-xs font-mono text-cyan-400/60 space-y-1">
+            <p>âœ‹ Raise index finger to draw â€¢ âœŠ Close fist to pause â€¢ ðŸ¤ Pinch to erase</p>
+            <p>Draw in the air, spawn 3D objects, manipulate them with your hands. Make it cinematic.</p>
+          </div>
+        </div>
+      </div>
+
+      {/* Styles */}
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&display=swap');
+        
+        * {
+          font-family: 'Space Mono', monospace;
+        }
+
+        input[type="range"]::-webkit-slider-thumb {
+          appearance: none;
+          width: 16px;
+          height: 16px;
+          border-radius: 50%;
+          background: #00ff88;
+          cursor: pointer;
+          box-shadow: 0 0 8px #00ff88;
+        }
+
+        input[type="range"]::-moz-range-thumb {
+          width: 16px;
+          height: 16px;
+          border-radius: 50%;
+          background: #00ff88;
+          cursor: pointer;
+          border: none;
+          box-shadow: 0 0 8px #00ff88;
+        }
+      `}</style>
+    </div>
+  );
+}
